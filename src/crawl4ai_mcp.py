@@ -31,14 +31,15 @@ knowledge_graphs_path = Path(__file__).resolve().parent.parent / 'knowledge_grap
 sys.path.append(str(knowledge_graphs_path))
 
 from utils import (
+    smart_chunk_markdown, extract_section_info, extract_code_blocks, process_code_example,
     get_supabase_client, 
     add_documents_to_supabase, 
-    search_documents,
-    extract_code_blocks,
-    generate_code_example_summary,
-    add_code_examples_to_supabase,
+    add_code_examples_to_supabase, 
+    extract_source_summary, 
     update_source_info,
-    extract_source_summary,
+    is_pdf, process_pdf_url, process_pdf_batch,
+    search_documents,
+    generate_code_example_summary,
     search_code_examples
 )
 
@@ -560,6 +561,19 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             # For text files, use simple crawl
             crawl_results = await crawl_markdown_file(crawler, url)
             crawl_type = "text_file"
+        elif is_pdf(url):
+            # For PDF files, download and extract text
+            print(f"Processing PDF URL: {url}")
+            pdf_result = process_pdf_url(url)
+            if pdf_result:
+                crawl_results = [pdf_result]
+                crawl_type = "pdf"
+            else:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "Failed to process PDF file"
+                }, indent=2)
         elif is_sitemap(url):
             # For sitemaps, extract URLs and crawl in parallel
             sitemap_urls = parse_sitemap(url)

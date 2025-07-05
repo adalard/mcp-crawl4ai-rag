@@ -3,13 +3,18 @@ Utility functions for the Crawl4AI MCP server.
 """
 import os
 import concurrent.futures
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, BinaryIO
 import json
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
 import re
 import time
+import tempfile
+import requests
+from pathlib import Path
+import PyPDF2
+import io
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -736,3 +741,208 @@ def search_code_examples(
     except Exception as e:
         print(f"Error searching code examples: {e}")
         return []
+
+
+def is_pdf(url: str) -> bool:
+    """
+    Check if a URL is a PDF file.
+    
+    Args:
+        url: URL to check
+        
+    Returns:
+        True if the URL is a PDF file, False otherwise
+    """
+    return url.lower().endswith('.pdf')
+
+
+def download_pdf(url: str) -> Optional[bytes]:
+    """
+    Download a PDF file from a URL.
+    
+    Args:
+        url: URL of the PDF file
+        
+    Returns:
+        PDF file content as bytes, or None if download fails
+    """
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        
+        # Check if the content type is PDF
+        content_type = response.headers.get('Content-Type', '')
+        if 'application/pdf' not in content_type.lower() and not url.lower().endswith('.pdf'):
+            print(f"Warning: URL {url} does not appear to be a PDF (Content-Type: {content_type})")
+        
+        return response.content
+    except Exception as e:
+        print(f"Error downloading PDF from {url}: {e}")
+        return None
+
+
+def extract_text_from_pdf(pdf_content: bytes) -> str:
+    """
+    Extract text from a PDF file.
+    
+    Args:
+        pdf_content: PDF file content as bytes
+        
+    Returns:
+        Extracted text as a string
+    """
+    try:
+        # Create a PDF reader object
+        pdf_file = io.BytesIO(pdf_content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        
+        # Extract text from each page
+        text = []
+        for page_num in range(len(pdf_reader.pages)):
+            page = pdf_reader.pages[page_num]
+            text.append(page.extract_text())
+        
+        # Join all pages with double newlines for better separation
+        return "\n\n".join(text)
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return ""
+
+
+def process_pdf_url(url: str) -> Optional[Dict[str, str]]:
+    """
+    Process a PDF URL: download the PDF and extract its text.
+    
+    Args:
+        url: URL of the PDF file
+        
+    Returns:
+        Dictionary with URL and extracted text, or None if processing fails
+    """
+    try:
+        # Download the PDF
+        pdf_content = download_pdf(url)
+        if not pdf_content:
+            return None
+        
+        # Extract text from the PDF
+        text = extract_text_from_pdf(pdf_content)
+        if not text:
+            return None
+        
+        # Return the result as a dictionary
+        return {'url': url, 'markdown': text}
+    except Exception as e:
+        print(f"Error processing PDF URL {url}: {e}")
+        return None
+
+
+def process_pdf_batch(urls: List[str], max_workers: int = 5) -> List[Dict[str, str]]:
+    """
+    Process multiple PDF URLs in parallel.
+    
+    Args:
+        urls: List of PDF URLs to process
+        max_workers: Maximum number of concurrent workers
+        
+    Returns:
+        List of dictionaries with URL and extracted text
+    """
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(process_pdf_url, url): url for url in urls}
+        
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                result = future.result()
+                if result:
+                    results.append(result)
+            except Exception as e:
+                print(f"Error processing PDF URL {url}: {e}")
+    
+    return results
+
+
+def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
+    """Split text into chunks, respecting code blocks and paragraphs."""
+    chunks = []
+    start = 0
+    text_length = len(text)
+
+    while start < text_length:
+        # Calculate end position
+        end = start + chunk_size
+
+        # If we're at the end of the text, just take what's left
+        if end >= text_length:
+            chunks.append(text[start:].strip())
+            break
+
+        # Try to find a code block boundary first (```)
+        chunk = text[start:end]
+        code_block = chunk.rfind('```')
+        
+        # If we found a code block marker and it's not at the very beginning
+        if code_block > 0 and code_block > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+            end = start + code_block
+
+        # If no code block boundary, try to find a paragraph break
+        elif '\n\n' in chunk:
+            # Find the last paragraph break
+            last_break = chunk.rfind('\n\n')
+            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_break
+
+        # If no paragraph break, try to break at a sentence
+        elif '. ' in chunk:
+            # Find the last sentence break
+            last_period = chunk.rfind('. ')
+            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
+                end = start + last_period + 1
+
+        # Extract chunk and clean it up
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # Move start position for next chunk
+        start = end
+
+    return chunks
+
+
+def extract_section_info(chunk: str) -> Dict[str, Any]:
+    """
+    Extracts headers and stats from a chunk.
+    
+    Args:
+        chunk: Markdown chunk
+        
+    Returns:
+        Dictionary with headers and stats
+    """
+    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
+    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
+
+    return {
+        "headers": header_str,
+        "char_count": len(chunk),
+        "word_count": len(chunk.split())
+    }
+
+
+def process_code_example(args):
+    """
+    Process a single code example to generate its summary.
+    This function is designed to be used with concurrent.futures.
+    
+    Args:
+        args: Tuple containing (code, context_before, context_after)
+        
+    Returns:
+        The generated summary
+    """
+    code, context_before, context_after = args
+    return generate_code_example_summary(code, context_before, context_after)
