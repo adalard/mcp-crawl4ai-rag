@@ -3,7 +3,7 @@ Utility functions for the Crawl4AI MCP server.
 """
 import os
 import concurrent.futures
-from typing import List, Dict, Any, Optional, Tuple, BinaryIO
+from typing import List, Dict, Any, Optional, Tuple, BinaryIO, Union
 import json
 from supabase import create_client, Client
 from urllib.parse import urlparse
@@ -17,7 +17,86 @@ import PyPDF2
 import io
 
 # Load OpenAI API key for embeddings
-openai.api_key = os.getenv("OPENAI_API_KEY")
+llm_provider = os.getenv("LLM_PROVIDER", "openai").lower()
+if llm_provider == "openai":
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Ollama base URL
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+
+# LLM Provider Abstraction Layer
+class LLMResponse:
+    """Class to standardize responses from different LLM providers"""
+    def __init__(self, content: str, model: str):
+        self.content = content
+        self.model = model
+
+def get_llm_provider() -> str:
+    """Get the configured LLM provider"""
+    return os.getenv("LLM_PROVIDER", "openai").lower()
+
+def get_embedding_model() -> str:
+    """Get the embedding model based on the LLM provider"""
+    if get_llm_provider() == "ollama":
+        return os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+    else:
+        return "text-embedding-3-small"  # Default OpenAI embedding model
+
+def create_chat_completion(model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> LLMResponse:
+    """Create a chat completion using the configured LLM provider
+    
+    Args:
+        model: Model name to use (interpreted based on LLM provider)
+        messages: List of message dictionaries with role and content
+        temperature: Temperature for the model (0.0 to 1.0)
+        
+    Returns:
+        LLMResponse object with generated content
+    """
+    provider = get_llm_provider()
+    
+    if provider == "openai":
+        try:
+            response = openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            return LLMResponse(response.choices[0].message.content, model)
+        except Exception as e:
+            print(f"Error creating OpenAI chat completion: {e}")
+            return LLMResponse("Error generating response", model)
+    
+    elif provider == "ollama":
+        try:
+            # Format messages for Ollama API
+            ollama_messages = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
+            
+            # Make API call to Ollama
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": ollama_messages,
+                    "options": {"temperature": temperature}
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return LLMResponse(result["message"]["content"], model)
+            else:
+                print(f"Ollama API error: {response.status_code} - {response.text}")
+                return LLMResponse(f"Error: {response.status_code}", model)
+        except Exception as e:
+            print(f"Error creating Ollama chat completion: {e}")
+            return LLMResponse("Error generating response", model)
+    
+    else:
+        print(f"Unsupported LLM provider: {provider}")
+        return LLMResponse("Unsupported LLM provider", model)
 
 def get_supabase_client() -> Client:
     """
@@ -47,48 +126,104 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
+    provider = get_llm_provider()
+    embedding_model = get_embedding_model()
     max_retries = 3
     retry_delay = 1.0  # Start with 1 second delay
     
-    for retry in range(max_retries):
-        try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-                input=texts
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            if retry < max_retries - 1:
-                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
-                # Try creating embeddings one by one as fallback
-                print("Attempting to create embeddings individually...")
-                embeddings = []
-                successful_count = 0
+    if provider == "openai":
+        # OpenAI embedding logic
+        for retry in range(max_retries):
+            try:
+                response = openai.embeddings.create(
+                    model=embedding_model,
+                    input=texts
+                )
+                return [item.embedding for item in response.data]
+            except Exception as e:
+                if retry < max_retries - 1:
+                    print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
+                    # Try creating embeddings one by one as fallback
+                    print("Attempting to create embeddings individually...")
+                    embeddings = []
+                    successful_count = 0
+                    
+                    for i, text in enumerate(texts):
+                        try:
+                            individual_response = openai.embeddings.create(
+                                model=embedding_model,
+                                input=[text]
+                            )
+                            embeddings.append(individual_response.data[0].embedding)
+                            successful_count += 1
+                        except Exception as individual_error:
+                            print(f"Failed to create embedding for text {i}: {individual_error}")
+                            # Add zero embedding as fallback
+                            embeddings.append([0.0] * 1536)
+                    
+                    print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
+                    return embeddings
+    
+    elif provider == "ollama":
+        # Ollama embedding logic
+        embeddings = []
+        successful_count = 0
+        failed_indices = []
+        
+        # Process embeddings in batches for Ollama (since it doesn't support batch embedding natively)
+        for i, text in enumerate(texts):
+            try:
+                response = requests.post(
+                    f"{OLLAMA_BASE_URL}/api/embeddings",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "model": embedding_model,
+                        "prompt": text
+                    }
+                )
                 
-                for i, text in enumerate(texts):
-                    try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=[text]
-                        )
-                        embeddings.append(individual_response.data[0].embedding)
+                if response.status_code == 200:
+                    embedding_data = response.json()
+                    if "embedding" in embedding_data:
+                        embeddings.append(embedding_data["embedding"])
                         successful_count += 1
-                    except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
-                
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
-                return embeddings
+                    else:
+                        print(f"No embedding found in response for text {i}")
+                        embeddings.append([0.0] * 1536)  # Default size for compatibility
+                        failed_indices.append(i)
+                else:
+                    print(f"Error creating embedding for text {i}: {response.status_code} - {response.text}")
+                    embeddings.append([0.0] * 1536)  # Default size for compatibility
+                    failed_indices.append(i)
+                    
+                # Add a small delay to avoid rate limiting
+                if i < len(texts) - 1:
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"Exception creating embedding for text {i}: {e}")
+                embeddings.append([0.0] * 1536)  # Default size for compatibility
+                failed_indices.append(i)
+        
+        if failed_indices:
+            print(f"Failed to create embeddings for {len(failed_indices)}/{len(texts)} texts")
+        
+        print(f"Successfully created {successful_count}/{len(texts)} embeddings with Ollama")
+        return embeddings
+    
+    else:
+        print(f"Unsupported LLM provider: {provider}")
+        # Return zero embeddings as fallback
+        return [[0.0] * 1536 for _ in texts]
 
 def create_embedding(text: str) -> List[float]:
     """
-    Create an embedding for a single text using OpenAI's API.
+    Create an embedding for a single text using the configured LLM provider.
     
     Args:
         text: Text to create an embedding for
@@ -117,40 +252,53 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         - The contextual text that situates the chunk within the document
         - Boolean indicating if contextual embedding was performed
     """
+    # Check if we should use contextual embeddings
+    use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false").lower() == "true"
+    
+    if not use_contextual_embeddings or not full_document:
+        return chunk, False
+    
     model_choice = os.getenv("MODEL_CHOICE")
     
+    if not model_choice:
+        return chunk, False
+    
     try:
-        # Create the prompt for generating contextual information
-        prompt = f"""<document> 
-{full_document[:25000]} 
-</document>
-Here is the chunk we want to situate within the whole document 
-<chunk> 
-{chunk}
-</chunk> 
-Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
-
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
+        # Prepare the prompt for generating contextual information
+        system_prompt = """
+        You are an expert at understanding document context and summarization.
+        Your task is to provide contextual information about how a specific chunk of text fits 
+        within the larger document.
+        
+        Focus on:
+        1. Where this chunk appears in the document structure
+        2. What topics this chunk relates to
+        3. How this chunk relates to the document's main themes
+        4. Any key entities, concepts, or terminology that help situate this chunk
+        
+        Keep your response brief (under 100 words).
+        """
+        
+        # Call the LLM using our abstraction layer
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Full document:\n\n{full_document[:10000]}\n\nChunk to contextualize:\n\n{chunk}"}
+        ]
+        
+        llm_response = create_chat_completion(
             model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=200
+            messages=messages,
+            temperature=0.5
         )
         
-        # Extract the generated context
-        context = response.choices[0].message.content.strip()
+        contextual_info = llm_response.content.strip()
         
-        # Combine the context with the original chunk
-        contextual_text = f"{context}\n---\n{chunk}"
+        # Combine original chunk with contextual information
+        combined_text = f"{contextual_info}\n\n{chunk}"
+        return combined_text, True
         
-        return contextual_text, True
-    
     except Exception as e:
-        print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
+        print(f"Error generating contextual embedding: {e}")
         return chunk, False
 
 def process_chunk_with_context(args):
@@ -442,7 +590,7 @@ def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[D
     return code_blocks
 
 
-def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
+def generate_code_example_summary(code: str, context_before: str, context_after: str):
     """
     Generate a summary for a code example using its surrounding context.
     
@@ -456,38 +604,55 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     """
     model_choice = os.getenv("MODEL_CHOICE")
     
-    # Create the prompt
-    prompt = f"""<context_before>
-{context_before[-500:] if len(context_before) > 500 else context_before}
-</context_before>
-
-<code_example>
-{code[:1500] if len(code) > 1500 else code}
-</code_example>
-
-<context_after>
-{context_after[:500] if len(context_after) > 500 else context_after}
-</context_after>
-
-Based on the code example and its surrounding context, provide a concise summary (2-3 sentences) that describes what this code example demonstrates and its purpose. Focus on the practical application and key concepts illustrated.
-"""
+    # Default summary if something goes wrong
+    default_summary = "Code example"
+    
+    if not model_choice:
+        return default_summary
     
     try:
-        response = openai.chat.completions.create(
+        # Create a prompt to generate the summary
+        prompt = f"""You are a technical writer specializing in code documentation. Please provide a concise one-sentence summary that describes what this code example demonstrates, based on the code itself and its surrounding context.
+
+Context before the code:
+{context_before[:1000]}
+
+Code example:
+```
+{code[:2000]}
+```
+
+Context after the code:
+{context_after[:1000]}
+
+Write ONLY the summary, with no additional explanation, prefix, or quotes. The summary should be a single sentence with 15 words or less. Focus on the specific functionality or technique being demonstrated."""
+
+        # Call the LLM using our abstraction layer
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant specializing in technical documentation."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        llm_response = create_chat_completion(
             model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=100
+            messages=messages,
+            temperature=0.3
         )
         
-        return response.choices[0].message.content.strip()
-    
+        summary = llm_response.content.strip()
+        
+        # Remove any quotes that might be in the response
+        summary = summary.strip('"').strip("'").strip()
+        
+        # If the summary is too long, truncate it
+        if len(summary) > 100:
+            summary = summary[:97] + "..."
+        
+        return summary
+        
     except Exception as e:
         print(f"Error generating code example summary: {e}")
-        return "Code example for demonstration purposes."
+        return default_summary
 
 
 def add_code_examples_to_supabase(
@@ -634,9 +799,9 @@ def update_source_info(client: Client, source_id: str, summary: str, word_count:
 
 def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
     """
-    Extract a summary for a source from its content using an LLM.
+    Extract a summary for a source from its content using the configured LLM provider.
     
-    This function uses the OpenAI API to generate a concise summary of the source content.
+    This function uses the configured LLM to generate a concise summary of the source content.
     
     Args:
         source_id: The source ID (domain)
@@ -646,50 +811,49 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
     Returns:
         A summary string
     """
-    # Default summary if we can't extract anything meaningful
-    default_summary = f"Content from {source_id}"
-    
-    if not content or len(content.strip()) == 0:
-        return default_summary
-    
     # Get the model choice from environment variables
     model_choice = os.getenv("MODEL_CHOICE")
     
-    # Limit content length to avoid token limits
-    truncated_content = content[:25000] if len(content) > 25000 else content
-    
-    # Create the prompt for generating the summary
-    prompt = f"""<source_content>
-{truncated_content}
-</source_content>
-
-The above content is from the documentation for '{source_id}'. Please provide a concise summary (3-5 sentences) that describes what this library/tool/framework is about. The summary should help understand what the library/tool/framework accomplishes and the purpose.
-"""
+    if not model_choice:
+        return f"Content from {source_id}"
     
     try:
-        # Call the OpenAI API to generate the summary
-        response = openai.chat.completions.create(
+        # Prepare a sample of the content
+        # Take the first part of the content
+        sample = content[:20000]  # Use first 20k characters as a sample
+        
+        # Create the prompt for the summary generation
+        prompt = f"""Please provide a concise summary of the content from the website {source_id}. Focus on the main topics, themes, and the type of information provided. Keep the summary under {max_length} characters.
+
+Content sample:
+{sample}
+
+Summary:"""
+        
+        # Call the LLM using our abstraction layer
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that provides concise summaries of web content."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        llm_response = create_chat_completion(
             model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=150
+            messages=messages,
+            temperature=0.7
         )
         
-        # Extract the generated summary
-        summary = response.choices[0].message.content.strip()
+        # Extract the summary from the response
+        summary = llm_response.content.strip()
         
-        # Ensure the summary is not too long
+        # Truncate if necessary
         if len(summary) > max_length:
-            summary = summary[:max_length] + "..."
+            summary = summary[:max_length - 3] + "..."
             
         return summary
-    
+        
     except Exception as e:
-        print(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
-        return default_summary
+        print(f"Error extracting summary for {source_id}: {e}")
+        return f"Content from {source_id}"
 
 
 def search_code_examples(

@@ -8,7 +8,7 @@ A powerful implementation of the [Model Context Protocol (MCP)](https://modelcon
 
 With this MCP server, you can <b>scrape anything</b> and then <b>use that knowledge anywhere</b> for RAG.
 
-The primary goal is to bring this MCP server into [Archon](https://github.com/coleam00/Archon) as I evolve it to be more of a knowledge engine for AI coding assistants to build AI agents. This first version of the Crawl4AI/RAG MCP server will be improved upon greatly soon, especially making it more configurable so you can use different embedding models and run everything locally with Ollama.
+The primary goal is to bring this MCP server into [Archon](https://github.com/coleam00/Archon) as I evolve it to be more of a knowledge engine for AI coding assistants to build AI agents. This version of the Crawl4AI/RAG MCP server supports both OpenAI and local Ollama for LLM functionality, allowing you to choose between cloud-based or fully local deployment.
 
 Consider this GitHub repository a testbed, hence why I haven't been super actively address issues and pull requests yet. I certainly will though as I bring this into Archon V2!
 
@@ -31,7 +31,7 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 
 1. **Integration with Archon**: Building this system directly into [Archon](https://github.com/coleam00/Archon) to create a comprehensive knowledge engine for AI coding assistants to build better AI agents.
 
-2. **Multiple Embedding Models**: Expanding beyond OpenAI to support a variety of embedding models, including the ability to run everything locally with Ollama for complete control and privacy.
+2. **Multiple LLM Providers**: Support for both OpenAI and Ollama as LLM providers, with the ability to run everything locally with Ollama for complete control and privacy.
 
 3. **Advanced RAG Strategies**: Implementing sophisticated retrieval techniques like contextual retrieval, late chunking, and others to move beyond basic "naive lookups" and significantly enhance the power and precision of the RAG system, especially as it integrates with Archon.
 
@@ -185,8 +185,16 @@ HOST=0.0.0.0
 PORT=8051
 TRANSPORT=sse
 
+# LLM Provider Configuration
+# Choose between "openai" or "ollama"
+LLM_PROVIDER=openai
+
 # OpenAI API Configuration
 OPENAI_API_KEY=your_openai_api_key
+
+# Ollama Configuration
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
 
 # LLM for summaries and contextual embeddings
 MODEL_CHOICE=gpt-4.1-nano
@@ -363,7 +371,10 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "args": ["path/to/crawl4ai-mcp/src/crawl4ai_mcp.py"],
       "env": {
         "TRANSPORT": "stdio",
+        "LLM_PROVIDER": "openai",
         "OPENAI_API_KEY": "your_openai_api_key",
+        "OLLAMA_BASE_URL": "http://localhost:11434",
+        "OLLAMA_EMBEDDING_MODEL": "nomic-embed-text",
         "SUPABASE_URL": "your_supabase_url",
         "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
         "USE_KNOWLEDGE_GRAPH": "false",
@@ -385,7 +396,10 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
       "command": "docker",
       "args": ["run", "--rm", "-i", 
                "-e", "TRANSPORT", 
+               "-e", "LLM_PROVIDER",
                "-e", "OPENAI_API_KEY", 
+               "-e", "OLLAMA_BASE_URL",
+               "-e", "OLLAMA_EMBEDDING_MODEL",
                "-e", "SUPABASE_URL", 
                "-e", "SUPABASE_SERVICE_KEY",
                "-e", "USE_KNOWLEDGE_GRAPH",
@@ -395,7 +409,10 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
                "mcp/crawl4ai"],
       "env": {
         "TRANSPORT": "stdio",
+        "LLM_PROVIDER": "openai",
         "OPENAI_API_KEY": "your_openai_api_key",
+        "OLLAMA_BASE_URL": "http://localhost:11434",
+        "OLLAMA_EMBEDDING_MODEL": "nomic-embed-text",
         "SUPABASE_URL": "your_supabase_url",
         "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
         "USE_KNOWLEDGE_GRAPH": "false",
