@@ -80,13 +80,32 @@ def create_chat_completion(model: str, messages: List[Dict[str, str]], temperatu
                 json={
                     "model": model,
                     "messages": ollama_messages,
-                    "options": {"temperature": temperature}
+                    "options": {"temperature": temperature},
+                    "stream": False  # Explicitly disable streaming to get a complete response
                 }
             )
             
             if response.status_code == 200:
-                result = response.json()
-                return LLMResponse(result["message"]["content"], model)
+                # Handle potential streaming/multi-line response
+                try:
+                    result = response.json()
+                    return LLMResponse(result["message"]["content"], model)
+                except json.JSONDecodeError as json_err:
+                    print(f"JSON decode error: {json_err}")
+                    # Try to parse the first valid JSON object from the response
+                    response_text = response.text.strip()
+                    try:
+                        # Find the first complete JSON object
+                        first_json_end = response_text.find("}\n")
+                        if first_json_end > 0:
+                            first_json = response_text[:first_json_end + 1]
+                            result = json.loads(first_json)
+                            return LLMResponse(result["message"]["content"], model)
+                    except Exception as parse_err:
+                        print(f"Failed to parse streaming response: {parse_err}")
+                    
+                    # Fallback to returning the raw text if JSON parsing fails
+                    return LLMResponse(f"Error parsing response: {response_text[:100]}...", model)
             else:
                 print(f"Ollama API error: {response.status_code} - {response.text}")
                 return LLMResponse(f"Error: {response.status_code}", model)
@@ -179,23 +198,48 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
         for i, text in enumerate(texts):
             try:
                 response = requests.post(
-                    f"{OLLAMA_BASE_URL}/api/embeddings",
+                    f"{OLLAMA_BASE_URL}/api/embed",
                     headers={"Content-Type": "application/json"},
                     json={
                         "model": embedding_model,
-                        "prompt": text
+                        "input": text
                     }
                 )
                 
                 if response.status_code == 200:
-                    embedding_data = response.json()
-                    if "embedding" in embedding_data:
-                        embeddings.append(embedding_data["embedding"])
-                        successful_count += 1
-                    else:
-                        print(f"No embedding found in response for text {i}")
-                        embeddings.append([0.0] * 1536)  # Default size for compatibility
-                        failed_indices.append(i)
+                    try:
+                        embedding_data = response.json()
+                        if "embedding" in embedding_data:
+                            embeddings.append(embedding_data["embedding"])
+                            successful_count += 1
+                        else:
+                            print(f"No embedding found in response for text {i}")
+                            embeddings.append([0.0] * 1536)  # Default size for compatibility
+                            failed_indices.append(i)
+                    except json.JSONDecodeError as json_err:
+                        print(f"JSON decode error for embedding {i}: {json_err}")
+                        # Try to extract the embedding from potentially malformed JSON
+                        try:
+                            # Find the embedding array in the response text
+                            response_text = response.text.strip()
+                            # Look for the embedding array pattern
+                            import re
+                            embedding_match = re.search(r'"embedding":\s*\[(.*?)\]', response_text)
+                            if embedding_match:
+                                # Parse the embedding array
+                                embedding_str = embedding_match.group(1)
+                                embedding_values = [float(x) for x in embedding_str.split(',')]
+                                embeddings.append(embedding_values)
+                                successful_count += 1
+                                print(f"Successfully extracted embedding from malformed JSON for text {i}")
+                            else:
+                                print(f"Could not extract embedding from response for text {i}")
+                                embeddings.append([0.0] * 1536)  # Default size for compatibility
+                                failed_indices.append(i)
+                        except Exception as extract_err:
+                            print(f"Failed to extract embedding from response: {extract_err}")
+                            embeddings.append([0.0] * 1536)  # Default size for compatibility
+                            failed_indices.append(i)
                 else:
                     print(f"Error creating embedding for text {i}: {response.status_code} - {response.text}")
                     embeddings.append([0.0] * 1536)  # Default size for compatibility
@@ -963,11 +1007,18 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
         # Extract text from each page
         text = []
         for page_num in range(len(pdf_reader.pages)):
-            page = pdf_reader.pages[page_num]
-            text.append(page.extract_text())
+            try:
+                page = pdf_reader.pages[page_num]
+                page_text = page.extract_text()
+                if page_text and page_text.strip():
+                    text.append(page_text)
+            except Exception as page_error:
+                print(f"Error extracting text from page {page_num}: {page_error}")
         
         # Join all pages with double newlines for better separation
-        return "\n\n".join(text)
+        extracted_text = "\n\n".join(text)
+        print(f"Successfully extracted {len(text)} pages from PDF, total length: {len(extracted_text)} characters")
+        return extracted_text
     except Exception as e:
         print(f"Error extracting text from PDF: {e}")
         return ""
@@ -1029,11 +1080,31 @@ def process_pdf_batch(urls: List[str], max_workers: int = 5) -> List[Dict[str, s
     return results
 
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
+def smart_chunk_markdown(text: str, chunk_size: int = 2500) -> List[str]:
+    """Split text into chunks, respecting code blocks and paragraphs.
+    
+    For PDFs and other complex documents, we use a smaller default chunk size (2500)
+    to ensure better compatibility with embedding models.
+    """
+    # Check if text is empty or None
+    if not text:
+        print("Warning: Empty text provided to smart_chunk_markdown")
+        return []
+        
+    # For PDFs, we'll use a more aggressive chunking strategy
+    is_pdf_content = '\f' in text  # Form feed character often appears in PDFs
+    
+    # Use smaller chunks for PDFs to avoid embedding issues
+    if is_pdf_content:
+        print(f"Detected PDF content, using smaller chunk size for better embedding compatibility")
+        # Use a smaller chunk size for PDFs to avoid embedding issues
+        chunk_size = min(chunk_size, 2500)
+    
     chunks = []
     start = 0
     text_length = len(text)
+    
+    print(f"Chunking text of length {text_length} with chunk size {chunk_size}")
 
     while start < text_length:
         # Calculate end position
@@ -1074,6 +1145,7 @@ def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
         # Move start position for next chunk
         start = end
 
+    print(f"Created {len(chunks)} chunks from text")
     return chunks
 
 
